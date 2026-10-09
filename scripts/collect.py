@@ -23,22 +23,55 @@ def valid_url(value):
     return urllib.parse.urlsplit(value or '').scheme in ('http', 'https')
 
 def date(value):
+    if not value:
+        return None
     try:
         parsed = email.utils.parsedate_to_datetime(value)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=dt.timezone.utc)
-        return parsed.astimezone(dt.timezone.utc).isoformat()
     except (TypeError, ValueError, OverflowError):
+        try:
+            parsed = dt.datetime.fromisoformat(value.strip().replace('Z', '+00:00'))
+        except (TypeError, ValueError):
+            return None
+    if parsed.tzinfo is None:
         return None
+    return parsed.astimezone(dt.timezone.utc).isoformat()
+
+def child_text(item, *names):
+    for name in names:
+        for child in item:
+            if child.tag.split('}')[-1] == name:
+                return ''.join(child.itertext()).strip()
+    return ''
+
+
+def is_breaking(title):
+    return bool(re.match(r'^\s*(?:[\[【(（〈《]\s*(?:속보|速報)\s*[\]】)）〉》]|(?:속보|速報)\s*[:：])', title))
+
+def breaking_items(items):
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=24)
+    result = []
+    for item in items:
+        if not is_breaking(item.get('title', '')):
+            continue
+        try:
+            published = dt.datetime.fromisoformat(item.get('publishedAt') or '')
+            if published.tzinfo is None or not cutoff <= published <= dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5):
+                continue
+        except (ValueError, TypeError):
+            continue
+        result.append(dict(item, breaking=True))
+    return sorted(unique(result), key=lambda x: x['publishedAt'], reverse=True)
 
 def parse_feed(raw, source, trend=False):
     if b'<!DOCTYPE' in raw.upper() or b'<!ENTITY' in raw.upper():
         raise ValueError('Unsupported XML declarations')
     root = ET.fromstring(raw)
     result = []
-    for item in root.findall('.//item')[:60]:
-        title = clean(item.findtext('title'))
-        link = (item.findtext('link') or '').strip()
+    for item in [node for node in root.iter() if node.tag.split('}')[-1] in ('item', 'entry')][:120]:
+        title = clean(child_text(item, 'title'))
+        link = child_text(item, 'link')
+        if not link:
+            link = next((x.get('href', '') for x in item if x.tag.split('}')[-1] == 'link' and x.get('rel', 'alternate') == 'alternate'), '')
         if not title:
             continue
         if trend and not valid_url(link):
@@ -49,12 +82,12 @@ def parse_feed(raw, source, trend=False):
             traffic = next((clean(x.text) for x in item if x.tag.endswith('}approx_traffic')), '')
             result.append({'title': title, 'url': link, 'traffic': traffic})
         else:
-            publisher = clean(item.findtext('source')) or source
+            publisher = clean(child_text(item, 'source')) or source
             if publisher and title.endswith(' - ' + publisher):
                 title = title[:-(len(publisher) + 3)]
             result.append({'id': hashlib.sha256(link.encode()).hexdigest()[:16], 'title': title,
-                           'url': link, 'source': publisher, 'publishedAt': date(item.findtext('pubDate')),
-                           'breaking': bool(re.search(r'\[속보\]|【速報】|\[速報\]|^속보\s*[:：]|^速報\s*[:：]', title))})
+                           'url': link, 'source': publisher, 'publishedAt': date(child_text(item, 'pubDate', 'date', 'published', 'updated')),
+                           'breaking': is_breaking(title)})
     if not result:
         raise ValueError('No valid items in RSS feed')
     return result
@@ -67,7 +100,7 @@ def fetch(url, name, trend=False):
         raise ValueError('RSS response too large')
     return parse_feed(raw, name, trend)
 
-def unique(items):
+def unique(items, limit=240):
     seen_urls, seen_titles, result = set(), set(), []
     for item in items:
         key = re.sub(r'\W+', '', item['title']).casefold()
@@ -76,7 +109,24 @@ def unique(items):
         seen_urls.add(item['url'])
         seen_titles.add(key)
         result.append(item)
-    return result[:40]
+    return result[:limit]
+
+def balanced_articles(snapshots):
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=48)
+    ceiling = dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)
+    groups = []
+    for snapshot in snapshots.values():
+        group = []
+        for article in snapshot.get('articles', []):
+            try:
+                published = dt.datetime.fromisoformat(article.get('publishedAt') or '')
+                if cutoff <= published <= ceiling:
+                    group.append(article)
+            except (ValueError, TypeError):
+                continue
+        groups.append(group)
+    interleaved = [group[i] for i in range(max(map(len, groups), default=0)) for group in groups if i < len(group)]
+    return unique(interleaved)
 
 def collect():
     config = json.loads((DATA / 'sources.json').read_text())
@@ -95,7 +145,7 @@ def collect():
             state['attemptedAt'] = now()
             errors, articles = [], []
             old_sources = previous.get('sourceSnapshots', {})
-            snapshots = dict(old_sources)
+            snapshots = {src['name']: old_sources[src['name']] for src in config[code]['news'] if src['name'] in old_sources}
             successes = []
             for src, future in zip(config[code]['news'], news_futures):
                 try:
@@ -107,8 +157,8 @@ def collect():
                     errors.append(src['name'] + ': ' + type(exc).__name__)
                 articles.extend(snapshots.get(src['name'], {}).get('articles', []))
             state['sourceSnapshots'] = snapshots
+            state['articles'] = balanced_articles(snapshots)
             if successes:
-                state['articles'] = unique(articles)
                 state['newsUpdatedAt'] = max(successes)
             state['newsErrors'] = errors
             try:
@@ -124,6 +174,10 @@ def collect():
     return data
 
 def write_data(data):
+    for state in data.get('countries', {}).values():
+        candidates = [a for source in state.get('sourceSnapshots', {}).values() for a in source.get('articles', [])]
+        candidates.extend(state.get('articles', []))
+        state['breakingArticles'] = breaking_items(candidates)
     text = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
     target = DATA / 'news.json'
     temp = target.with_suffix('.tmp')
