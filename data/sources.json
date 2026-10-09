@@ -1,0 +1,20 @@
+{
+  "KR": {
+    "news": [
+      {
+        "name": "SBS",
+        "url": "https://news.sbs.co.kr/news/SectionRssFeed.do?sectionId=01&plink=RSSREADER"
+      }
+    ],
+    "trends": "https://trends.google.com/trending/rss?geo=KR"
+  },
+  "JP": {
+    "news": [
+      {
+        "name": "Yahoo! JAPAN",
+        "url": "https://news.yahoo.co.jp/rss/topics/top-picks.xml"
+      }
+    ],
+    "trends": "https://trends.google.com/trending/rss?geo=JP"
+  }
+}
