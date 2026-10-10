@@ -3,6 +3,8 @@ import datetime as dt
 import email.utils
 import hashlib
 import html
+import difflib
+import unicodedata
 import json
 import re
 import urllib.parse
@@ -45,22 +47,13 @@ def child_text(item, *names):
 
 
 def is_breaking(title):
-    return bool(re.match(r'^\s*(?:[\[【(（〈《]\s*(?:속보|速報)\s*[\]】)）〉》]|(?:속보|速報)\s*[:：])', title))
+    return bool(re.match(r'^\s*(?:[\[【(（〈《]\s*(?:속보|速報|快訊|快讯|快報)\s*[\]】)）〉》]|(?:속보|速報|快訊|快讯|快報)\s*[:：])', title))
 
 def breaking_items(items):
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=24)
-    result = []
-    for item in items:
-        if not is_breaking(item.get('title', '')):
-            continue
-        try:
-            published = dt.datetime.fromisoformat(item.get('publishedAt') or '')
-            if published.tzinfo is None or not cutoff <= published <= dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5):
-                continue
-        except (ValueError, TypeError):
-            continue
-        result.append(dict(item, breaking=True))
-    return sorted(unique(result), key=lambda x: x['publishedAt'], reverse=True)
+    candidates = [dict(item, breaking=True) for item in items if is_breaking(item.get('title', ''))]
+    candidates.sort(key=lambda x: x.get('publishedAt') or '', reverse=True)
+    return unique(candidates, limit=30)
+
 
 def parse_feed(raw, source, trend=False):
     if b'<!DOCTYPE' in raw.upper() or b'<!ENTITY' in raw.upper():
@@ -100,33 +93,59 @@ def fetch(url, name, trend=False):
         raise ValueError('RSS response too large')
     return parse_feed(raw, name, trend)
 
-def unique(items, limit=240):
-    seen_urls, seen_titles, result = set(), set(), []
-    for item in items:
-        key = re.sub(r'\W+', '', item['title']).casefold()
-        if item['url'] in seen_urls or key in seen_titles:
-            continue
-        seen_urls.add(item['url'])
-        seen_titles.add(key)
-        result.append(item)
-    return result[:limit]
+def title_key(title):
+    title = unicodedata.normalize('NFKC', title)
+    title = re.sub(r'[\[【][^\]】]*[\]】]', '', title)
+    title = re.sub(r'\([^)]*(?:종합|상보|영상|사진|보완)[^)]*\)', '', title)
+    return re.sub(r'[^\w]', '', title).casefold()
 
-def balanced_articles(snapshots):
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=48)
-    ceiling = dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)
+def similar_title(a, b):
+    if a == b:
+        return True
+    if min(len(a), len(b)) < 14:
+        return False
+    if difflib.SequenceMatcher(None, a, b, autojunk=False).ratio() >= .79:
+        return True
+    sa, sb = {a[i:i+3] for i in range(len(a)-2)}, {b[i:i+3] for i in range(len(b)-2)}
+    return bool(sa and sb) and len(sa & sb) / len(sa | sb) >= .56
+
+def canonical_url(url):
+    parsed = urllib.parse.urlsplit(url)
+    query = [(k, v) for k, v in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True) if not k.lower().startswith('utm_') and k.lower() not in ('fbclid', 'gclid', 'outputtype', 'ref')]
+    return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip('/'), urllib.parse.urlencode(sorted(query)), ''))
+
+def unique(items, limit=100):
+    seen_urls, keys, result = set(), [], []
+    for item in items:
+        key = title_key(item['title'])
+        url_key = canonical_url(item['url'])
+        if url_key in seen_urls or any(similar_title(key, previous) for previous in keys):
+            continue
+        seen_urls.add(url_key)
+        keys.append(key)
+        result.append(item)
+        if len(result) >= limit:
+            break
+    return result
+
+def balanced_articles(snapshots, current=None):
+    current = current or dt.datetime.now(dt.timezone.utc)
+    start = current.replace(minute=0, second=0, microsecond=0)
+    end = start + dt.timedelta(hours=1)
     groups = []
     for snapshot in snapshots.values():
         group = []
         for article in snapshot.get('articles', []):
             try:
                 published = dt.datetime.fromisoformat(article.get('publishedAt') or '')
-                if cutoff <= published <= ceiling:
+                if start <= published < end and published <= current:
                     group.append(article)
             except (ValueError, TypeError):
                 continue
         groups.append(group)
     interleaved = [group[i] for i in range(max(map(len, groups), default=0)) for group in groups if i < len(group)]
     return unique(interleaved)
+
 
 def collect():
     config = json.loads((DATA / 'sources.json').read_text())
@@ -137,7 +156,7 @@ def collect():
     futures = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
         for code, cfg in config.items():
-            futures[code] = ([pool.submit(fetch, s['url'], s['name']) for s in cfg['news']],
+            futures[code] = ([pool.submit(fetch, s['url'], s.get('publisher', s['name'])) for s in cfg['news']],
                              pool.submit(fetch, cfg['trends'], 'Google Trends', True))
         for code, (news_futures, trend_future) in futures.items():
             previous = data['countries'].get(code, {})
@@ -177,7 +196,10 @@ def write_data(data):
     for state in data.get('countries', {}).values():
         candidates = [a for source in state.get('sourceSnapshots', {}).values() for a in source.get('articles', [])]
         candidates.extend(state.get('articles', []))
+        candidates.extend(state.get('breakingArticles', []))
         state['breakingArticles'] = breaking_items(candidates)
+        state['articles'] = balanced_articles(state.get('sourceSnapshots', {}))
+        state['newsWindowStart'] = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0).isoformat()
     text = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
     target = DATA / 'news.json'
     temp = target.with_suffix('.tmp')
