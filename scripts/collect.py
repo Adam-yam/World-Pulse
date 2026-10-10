@@ -5,6 +5,8 @@ import hashlib
 import html
 import difflib
 import unicodedata
+import time
+from zoneinfo import ZoneInfo
 import json
 import re
 import urllib.parse
@@ -49,10 +51,32 @@ def child_text(item, *names):
 def is_breaking(title):
     return bool(re.match(r'^\s*(?:[\[【(（〈《]\s*(?:속보|速報|快訊|快讯|快報)\s*[\]】)）〉》]|(?:속보|速報|快訊|快讯|快報)\s*[:：])', title))
 
-def breaking_items(items):
-    candidates = [dict(item, breaking=True) for item in items if is_breaking(item.get('title', ''))]
-    candidates.sort(key=lambda x: x.get('publishedAt') or '', reverse=True)
+ZONES = {'KR': 'Asia/Seoul', 'JP': 'Asia/Tokyo', 'TW': 'Asia/Taipei'}
+
+def timestamp(item):
+    try:
+        value = dt.datetime.fromisoformat(item.get('publishedAt') or '')
+        return value if value.tzinfo else None
+    except (ValueError, TypeError):
+        return None
+
+def breaking_items(items, code='KR', current=None):
+    current = current or dt.datetime.now(dt.timezone.utc)
+    local = current.astimezone(ZoneInfo(ZONES[code]))
+    start = local.replace(hour=0, minute=0, second=0, microsecond=0) - dt.timedelta(days=1)
+    candidates = [dict(item, breaking=True) for item in items
+                  if is_breaking(item.get('title', '')) and timestamp(item) is not None
+                  and start <= timestamp(item) <= current]
+    candidates.sort(key=lambda x: timestamp(x), reverse=True)
     return unique(candidates, limit=30)
+
+def archive_articles(old, fresh, current):
+    merged = {}
+    for item in old + fresh:
+        published = timestamp(item)
+        if published is not None and current - dt.timedelta(days=3) <= published <= current:
+            merged[canonical_url(item['url'])] = item
+    return sorted(merged.values(), key=timestamp, reverse=True)[:3000]
 
 
 def parse_feed(raw, source, trend=False):
@@ -60,7 +84,7 @@ def parse_feed(raw, source, trend=False):
         raise ValueError('Unsupported XML declarations')
     root = ET.fromstring(raw)
     result = []
-    for item in [node for node in root.iter() if node.tag.split('}')[-1] in ('item', 'entry')][:120]:
+    for item in [node for node in root.iter() if node.tag.split('}')[-1] in ('item', 'entry')][:500]:
         title = clean(child_text(item, 'title'))
         link = child_text(item, 'link')
         if not link:
@@ -86,12 +110,19 @@ def parse_feed(raw, source, trend=False):
     return result
 
 def fetch(url, name, trend=False):
-    request = urllib.request.Request(url, headers={'User-Agent': 'EastPulse/0.1 RSS Reader', 'Accept': 'application/rss+xml, application/xml, text/xml'})
-    with urllib.request.urlopen(request, timeout=20) as response:
-        raw = response.read(4_000_001)
-    if len(raw) > 4_000_000:
-        raise ValueError('RSS response too large')
-    return parse_feed(raw, name, trend)
+    request = urllib.request.Request(url, headers={'User-Agent': 'WorldPulse/0.1 RSS Reader', 'Accept': 'application/rss+xml, application/xml, text/xml'})
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                raw = response.read(4_000_001)
+            if len(raw) > 4_000_000:
+                raise ValueError('RSS response too large')
+            return parse_feed(raw, name, trend)
+        except (OSError, ET.ParseError, ValueError):
+            if attempt == 2:
+                raise
+            time.sleep(attempt + 1)
+
 
 def title_key(title):
     title = unicodedata.normalize('NFKC', title)
@@ -130,8 +161,8 @@ def unique(items, limit=100):
 
 def balanced_articles(snapshots, current=None):
     current = current or dt.datetime.now(dt.timezone.utc)
-    start = current.replace(minute=0, second=0, microsecond=0)
-    end = start + dt.timedelta(hours=1)
+    end = current.replace(minute=0, second=0, microsecond=0)
+    start = end - dt.timedelta(hours=1)
     groups = []
     for snapshot in snapshots.values():
         group = []
@@ -148,6 +179,7 @@ def balanced_articles(snapshots, current=None):
 
 
 def collect():
+    run_time = dt.datetime.now(dt.timezone.utc)
     config = json.loads((DATA / 'sources.json').read_text())
     try:
         data = json.loads((DATA / 'news.json').read_text())
@@ -170,14 +202,18 @@ def collect():
                 try:
                     current = future.result()
                     stamp = now()
-                    snapshots[src['name']] = {'updatedAt': stamp, 'articles': current}
+                    retained = snapshots.get(src['name'], {}).get('articles', [])
+                    snapshots[src['name']] = {'updatedAt': stamp, 'articles': archive_articles(retained, current, run_time)}
                     successes.append(stamp)
                 except Exception as exc:
                     errors.append(src['name'] + ': ' + type(exc).__name__)
                 articles.extend(snapshots.get(src['name'], {}).get('articles', []))
             state['sourceSnapshots'] = snapshots
-            state['articles'] = balanced_articles(snapshots)
             if successes:
+                state['articles'] = balanced_articles(snapshots, run_time)
+                end = run_time.replace(minute=0, second=0, microsecond=0)
+                state['newsWindowStart'] = (end - dt.timedelta(hours=1)).isoformat()
+                state['newsWindowEnd'] = end.isoformat()
                 state['newsUpdatedAt'] = max(successes)
             state['newsErrors'] = errors
             try:
@@ -189,17 +225,16 @@ def collect():
             data['countries'][code] = state
             print(code, 'news:', len(state.get('articles', [])), 'trends:', len(state.get('trends', [])), 'errors:', len(errors) + len(state['trendErrors']))
     data['attemptedAt'] = now()
-    write_data(data)
+    write_data(data, run_time)
     return data
 
-def write_data(data):
-    for state in data.get('countries', {}).values():
+def write_data(data, current=None):
+    current = current or dt.datetime.now(dt.timezone.utc)
+    for code, state in data.get('countries', {}).items():
         candidates = [a for source in state.get('sourceSnapshots', {}).values() for a in source.get('articles', [])]
         candidates.extend(state.get('articles', []))
         candidates.extend(state.get('breakingArticles', []))
-        state['breakingArticles'] = breaking_items(candidates)
-        state['articles'] = balanced_articles(state.get('sourceSnapshots', {}))
-        state['newsWindowStart'] = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0).isoformat()
+        state['breakingArticles'] = breaking_items(candidates, code, current)
     text = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
     target = DATA / 'news.json'
     temp = target.with_suffix('.tmp')
